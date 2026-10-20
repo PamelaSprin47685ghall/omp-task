@@ -90,7 +90,7 @@ if [ "$INIT_CONFIG" = 1 ]; then
       say "keeping existing $dst"
     else
       sed "s#__HOME__#$HOME#g" "$ROOT/config/$f.example.yml" > "$dst"; chmod 600 "$dst"
-      say "wrote $dst (edit it: gateway URL and model ids)"
+      say "wrote $dst from the template — edit it (see README: Configure)"
     fi
   done
   tok="$HOME/.omp/gateway.token"

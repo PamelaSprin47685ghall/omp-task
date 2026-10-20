@@ -66,7 +66,7 @@ omp reads `~/.omp/agent/models.yml` (providers/models) and `~/.omp/agent/config.
    `setupVersion: 2` skips omp's interactive first-run wizard; `tools.approvalMode: yolo` is needed because headless runs can't answer approval prompts.
 4. If your gateway hostname needs a static mapping, add it to `/etc/hosts`.
 
-Check: `omp -p "Reply with exactly: PONG"` → `PONG`. Then run the smoke test:
+Check: `omp -p "Reply with exactly: PONG" </dev/null` → `PONG` (without a TTY, `omp -p` otherwise waits for piped stdin). Then run the smoke test:
 
 ```sh
 ~/.local/share/omp-task/tests/smoke.sh          # plain: run, steer, resume, stop, list
