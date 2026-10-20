@@ -1,0 +1,35 @@
+# ~/.omp/agent/models.yml — custom provider for an OpenAI-compatible gateway.
+# Works with any endpoint that speaks the OpenAI Chat Completions API
+# (LiteLLM, vLLM, OpenRouter, Ollama's /v1, a self-hosted router, ...).
+#
+# 1. Replace baseUrl with your gateway (must end in /v1 or whatever prefix serves /chat/completions).
+# 2. Put the API key in a file readable only by you:
+#      install -m 600 /dev/null ~/.omp/gateway.token && $EDITOR ~/.omp/gateway.token
+#    "!<command>" makes omp run the command and use its stdout as the key, so the key never
+#    appears in this file or on the command line. omp does not expand ~ here; use an absolute path
+#    (install.sh --init-config fills it in for you).
+# 3. List the model ids your gateway serves. The ids below are examples of three tiers.
+providers:
+  gateway:
+    baseUrl: https://gateway.example.com/v1
+    apiKey: "!cat __HOME__/.omp/gateway.token"
+    api: openai-completions
+    models:
+      - id: strong-model          # director / main agent (default, slow, plan roles)
+        name: strong-model
+        reasoning: true
+        input: [text, image]
+        contextWindow: 200000
+        maxTokens: 32000
+      - id: fast-model            # workers / subagents (task, smol, tiny roles)
+        name: fast-model
+        reasoning: false
+        input: [text]
+        contextWindow: 128000
+        maxTokens: 16000
+      - id: vision-model          # image understanding (vision role)
+        name: vision-model
+        reasoning: false
+        input: [text, image]
+        contextWindow: 128000
+        maxTokens: 16000

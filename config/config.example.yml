@@ -1,0 +1,13 @@
+# ~/.omp/agent/config.yml — model roles and headless defaults.
+# Model references are <provider>/<model id> from models.yml.
+setupVersion: 2            # skip omp's interactive first-run wizard
+modelRoles:
+  default: gateway/strong-model   # main agent, vibe director
+  slow: gateway/strong-model
+  plan: gateway/strong-model
+  task: gateway/fast-model        # task subagents and vibe "good" workers
+  smol: gateway/fast-model        # vibe "fast" workers, light helpers
+  tiny: gateway/fast-model
+  vision: gateway/vision-model
+tools:
+  approvalMode: yolo              # headless runs cannot answer approval prompts

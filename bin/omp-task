@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""omp-task — run Oh My Pi (omp) as a detached, steerable headless worker.
+
+Everything agent-side is native omp: the work runs in `omp --mode rpc --no-ui`
+(the official JSONL RPC protocol: prompt/steer/follow_up/abort/get_state), the
+conversation is a normal omp session file (resumable with `omp --resume`), and
+models/roles come from ~/.omp/agent/{config,models}.yml.
+
+What this script adds is the thin glue omp does not ship: a small detached
+supervisor per run that owns omp's RPC stdin, exposes a Unix control socket,
+and records the run on disk so other processes can wait/steer/inspect it.
+
+Usage
+  omp-task start <name> <workdir> <prompt> [--vibe] [--model M] [--max-time 30m] [-- omp args...]
+  omp-task wait <name> [--timeout SEC]        block until the run finishes; prints summary
+  omp-task steer <name> <message> [--agent ID] inject an instruction into the running turn
+                                              (--agent: steer one subagent / vibe worker directly)
+  omp-task followup <name> <message>          queue a message for after the current turn
+  omp-task status <name> [-n N] [--json]      state, current step, recent actions
+  omp-task transcript <name> [--full|--raw]   whole conversation (from the omp session file)
+  omp-task stop <name>                        abort the run and shut omp down
+  omp-task resume <name> <prompt>             continue a finished run's session with a new prompt
+  omp-task list [--json]                      all runs
+
+--vibe runs the session in omp's vibe mode: the top-level agent becomes a director whose only
+tools are read, todo and vibe_spawn/send/wait/kill/list; persistent "fast" (smol role) and
+"good" (task role) worker sessions do the actual work. omp ships /vibe only for the TUI, so
+--vibe launches omp from its official npm package via the sibling bin/omp-vibe, which enables
+vibe on the root session through the SDK seam runRootCommand(deps.createAgentSession) and then
+runs the unmodified RPC mode (see vibe/omp-vibe-rpc.ts in the omp-task repo). The mode is kept on
+resume. `status` lists workers (RPC get_subagents).
+
+Prompts may be given as @file to read them from a file, or - for stdin.
+
+Run directory  $OMP_TASK_RUNS/<name>/   (default ~/.omp-task/runs)
+  meta.json      name, workdir, created, omp version, options
+  state.json     status, round, step, last action, session file, exit code
+  prompts.jsonl  every prompt / steer / follow-up sent, with timestamps
+  actions.log    human-readable activity log (tools, messages, steers, subagents)
+  events.jsonl   raw RPC frames (streaming deltas omitted)
+  final.md       last assistant answer of the latest round
+  rounds/<k>.md  last assistant answer of round k
+  omp.stderr     omp's stderr;  supervisor.log  supervisor's own log
+  sessions/      omp session dir (--session-dir); ctl.sock while running
+
+Status values: starting, running, done, error, stopped.
+Exit codes of `wait`/`start --wait`: 0 done, 1 error, 2 stopped, 3 timeout, 4 not found.
+
+Environment
+  OMP_TASK_RUNS   runs directory (default ~/.omp-task/runs; OMP_TASK_HOME is accepted as an alias)
+  OMP_BIN         omp binary (default: `omp` on PATH, else ~/.local/bin/omp)
+  OMP_VIBE_BIN    vibe launcher (default: omp-vibe next to this script, symlinks resolved)
+"""
+from __future__ import annotations
+
+import argparse, base64, datetime as dt, json, os, shutil, signal, socket, subprocess
+import sys, threading, time, traceback
+from pathlib import Path
+
+HOME = Path(os.environ.get("OMP_TASK_RUNS") or os.environ.get("OMP_TASK_HOME")
+            or Path.home() / ".omp-task" / "runs").expanduser()
+OMP = os.environ.get("OMP_BIN") or shutil.which("omp") or str(Path.home() / ".local/bin/omp")
+OMP_VIBE = os.environ.get("OMP_VIBE_BIN") or str(Path(__file__).resolve().parent / "omp-vibe")
+TERMINAL = {"done", "error", "stopped"}
+EXIT = {"done": 0, "error": 1, "stopped": 2}
+
+
+# ----------------------------------------------------------------- helpers
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def run_dir(name: str) -> Path:
+    if not name or "/" in name or name.startswith("."):
+        sys.exit(f"invalid run name: {name!r}")
+    return HOME / name
+
+def read_json(p: Path, default=None):
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return default
+
+def write_json(p: Path, data) -> None:
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    os.replace(tmp, p)
+
+def append(p: Path, line: str) -> None:
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(line.rstrip("\n") + "\n")
+
+def short(s, n=160) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def read_prompt(arg: str) -> str:
+    if arg == "-":
+        return sys.stdin.read()
+    if arg.startswith("@") and Path(arg[1:]).is_file():
+        return Path(arg[1:]).read_text()
+    return arg
+
+def pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+def load_state(d: Path) -> dict:
+    st = read_json(d / "state.json", {}) or {}
+    # A supervisor that died without finalizing leaves a non-terminal state behind.
+    if st.get("status") not in TERMINAL and st.get("supervisor_pid") and not pid_alive(st["supervisor_pid"]):
+        st["status"] = "error"
+        st["error"] = st.get("error") or "supervisor exited unexpectedly"
+    return st
+
+def text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    out = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            out.append(b.get("text", ""))
+    return "".join(out)
+
+
+# --------------------------------------------------------------- supervisor
+class Supervisor:
+    """Owns one `omp --mode rpc` process for one round of a run."""
+
+    def __init__(self, d: Path):
+        self.d = d
+        self.meta = read_json(d / "meta.json")
+        self.state = read_json(d / "state.json", {})
+        self.lock = threading.Lock()          # serializes stdin writes + state writes
+        self.pending: dict[str, dict] = {}    # request id -> {"ev": Event, "resp": dict}
+        self.seq = 0
+        self.chunks: dict[str, list] = {}
+        self.ready = threading.Event()
+        self.prompt_done = threading.Event()
+        self.settled = threading.Event()
+        self.exited = threading.Event()
+        self.prompt_id = None
+        self.prompt_status = None
+        self.prompt_error = None
+        self.stop_requested = False
+        self.tools: dict[str, str] = {}
+
+    # -- logging / state
+    def log(self, msg: str) -> None:
+        append(self.d / "actions.log", f"{time.strftime('%H:%M:%SZ', time.gmtime())} {msg}")
+
+    def slog(self, msg: str) -> None:
+        append(self.d / "supervisor.log", f"{now()} {msg}")
+
+    def set_state(self, **kw) -> None:
+        with self.lock:
+            self.state.update(kw, updated=now())
+            write_json(self.d / "state.json", self.state)
+
+    # -- rpc
+    def send(self, frame: dict) -> None:
+        with self.lock:
+            self.proc.stdin.write((json.dumps(frame) + "\n").encode())
+            self.proc.stdin.flush()
+
+    def request(self, frame: dict, timeout=60.0) -> dict:
+        with self.lock:
+            self.seq += 1
+            rid = f"t{self.seq}"
+        frame = dict(frame, id=rid)
+        slot = {"ev": threading.Event(), "resp": None}
+        self.pending[rid] = slot
+        self.send(frame)
+        if not slot["ev"].wait(timeout):
+            self.pending.pop(rid, None)
+            return {"success": False, "error": f"timeout waiting for {frame['type']} response"}
+        return slot["resp"]
+
+    def reader(self) -> None:
+        try:
+            for raw in self.proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    fr = json.loads(line)
+                except ValueError:
+                    self.slog(f"non-json stdout: {short(line)}")
+                    continue
+                if fr.get("type") == "rpc_chunk":
+                    fr = self.reassemble(fr)
+                    if fr is None:
+                        continue
+                try:
+                    self.handle(fr)
+                except Exception:
+                    self.slog("handler error: " + traceback.format_exc())
+        finally:
+            self.exited.set()
+            self.prompt_done.set()
+            self.settled.set()
+
+    def reassemble(self, fr):
+        cid = fr["chunkId"]
+        parts = self.chunks.setdefault(cid, [])
+        if fr["index"] != len(parts):
+            self.slog(f"chunk sequence broken for {cid}")
+            self.chunks.pop(cid, None)
+            return None
+        parts.append(base64.b64decode(fr["data"]))
+        if len(parts) < fr["count"]:
+            return None
+        data = b"".join(self.chunks.pop(cid))
+        return json.loads(data.decode("utf-8"))
+
+    # -- event handling
+    def handle(self, fr: dict) -> None:
+        t = fr.get("type")
+        if t != "message_update":
+            append(self.d / "events.jsonl", json.dumps(fr, ensure_ascii=False))
+        if t == "ready":
+            self.ready.set()
+        elif t == "response":
+            slot = self.pending.pop(fr.get("id"), None)
+            if slot:
+                slot["resp"] = fr
+                slot["ev"].set()
+            if not fr.get("success"):
+                self.log(f"! {fr.get('command')} failed: {short(fr.get('error'))}")
+        elif t == "turn_start":
+            step = self.state.get("step", 0) + 1
+            self.set_state(step=step)
+        elif t == "tool_execution_start":
+            name = fr.get("toolName") or "?"
+            self.tools[fr.get("toolCallId", "")] = name
+            args = fr.get("args") or fr.get("arguments") or {}
+            self.log(f"→ {name} {short(json.dumps(args, ensure_ascii=False), 200)}")
+            self.set_state(current_action=f"{name} {short(json.dumps(args, ensure_ascii=False), 120)}")
+        elif t == "tool_execution_end":
+            name = fr.get("toolName") or self.tools.get(fr.get("toolCallId", ""), "?")
+            res = fr.get("result") or {}
+            body = text_of(res.get("content")) if isinstance(res, dict) else str(res)
+            mark = "✗" if fr.get("isError") else "✓"
+            self.log(f"  {mark} {name}: {short(body, 160)}")
+            self.set_state(current_action=None, tool_calls=self.state.get("tool_calls", 0) + 1)
+        elif t == "message_end":
+            m = fr.get("message") or {}
+            role = m.get("role")
+            if role == "assistant":
+                txt = text_of(m.get("content"))
+                calls = [b.get("name") for b in m.get("content") or [] if isinstance(b, dict) and b.get("type") == "toolCall"]
+                if txt.strip():
+                    self.log(f"assistant: {short(txt, 240)}")
+                if m.get("stopReason") == "error":
+                    self.log(f"! assistant error: {short(m.get('errorMessage'), 240)}")
+                usage = m.get("usage") or {}
+                self.set_state(last_model=f"{m.get('provider','')}/{m.get('model','')}".strip("/"),
+                               last_assistant=short(txt, 300) if txt.strip() else self.state.get("last_assistant"),
+                               tokens_out=self.state.get("tokens_out", 0) + int(usage.get("output") or 0),
+                               tokens_in_last=int(usage.get("input") or 0) + int(usage.get("cacheRead") or 0))
+                if calls and not txt.strip():
+                    self.log(f"assistant → {', '.join(map(str, calls))}")
+            elif role == "user":
+                self.log(f"user: {short(text_of(m.get('content')), 240)}")
+        elif t == "queue_update":
+            if fr.get("steering") or fr.get("followUp"):
+                self.log(f"queue: steering={fr.get('steering')} followUp={fr.get('followUp')}")
+        elif t in ("subagent_lifecycle", "subagent_progress"):
+            pl = fr.get("payload") or fr
+            if t == "subagent_lifecycle":
+                sid = pl.get("id") or "?"
+                subs = dict(self.state.get("subagents") or {})
+                subs[sid] = pl.get("status")
+                self.set_state(subagents=subs)
+                self.log(f"subagent {sid} ({pl.get('agent')}): {pl.get('status')}"
+                         + (" [detached]" if pl.get("detached") else ""))
+        elif t in ("auto_retry_start", "auto_compaction_start", "notice", "extension_error", "rpc_frame_error"):
+            self.log(f"{t}: {short(json.dumps({k: v for k, v in fr.items() if k != 'type'}, ensure_ascii=False), 240)}")
+        elif t == "prompt_result" and fr.get("id") == self.prompt_id:
+            self.prompt_status = fr.get("status")
+            self.prompt_error = fr.get("error")
+            self.log(f"prompt_result: {fr.get('status')}" + (f" {short((fr.get('error') or {}).get('message'), 200)}" if fr.get("error") else ""))
+            self.prompt_done.set()
+            if fr.get("sessionSettled"):
+                self.settled.set()
+        elif t == "session_settled":
+            self.settled.set()
+
+    # -- control socket
+    def serve(self) -> None:
+        path = str(self.d / "ctl.sock")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        os.chmod(path, 0o600)
+        srv.listen(8)
+        self.srv = srv
+        while not self.exited.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=self.client, args=(conn,), daemon=True).start()
+
+    def client(self, conn) -> None:
+        with conn:
+            try:
+                req = json.loads(conn.makefile().readline() or "{}")
+                op = req.get("op")
+                if op in ("steer", "follow_up"):
+                    kind = "steer" if op == "steer" else "follow_up"
+                    agent = req.get("agent")
+                    append(self.d / "prompts.jsonl", json.dumps({"ts": now(), "kind": kind, "agent": agent, "round": self.state.get("round"), "message": req["message"]}, ensure_ascii=False))
+                    self.log(f"{kind} sent{' to ' + agent if agent else ''}: {short(req['message'], 200)}")
+                    if agent:
+                        resp = self.request({"type": "steer_subagent", "subagentId": agent, "message": req["message"]})
+                    else:
+                        resp = self.request({"type": kind, "message": req["message"]})
+                elif op == "subagents":
+                    resp = self.request({"type": "get_subagents"})
+                elif op == "stop":
+                    self.stop_requested = True
+                    self.log("stop requested")
+                    resp = self.request({"type": "abort"}, timeout=30)
+                    self.settled.set(); self.prompt_done.set()
+                elif op == "get_state":
+                    resp = self.request({"type": "get_state"})
+                    if resp.get("success"):
+                        d = resp.get("data") or {}
+                        for k in ("systemPrompt", "dumpTools"):
+                            d.pop(k, None)
+                else:
+                    resp = {"success": False, "error": f"unknown op {op!r}"}
+            except Exception as e:  # noqa: BLE001
+                resp = {"success": False, "error": str(e)}
+            conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode())
+
+    # -- main
+    def run(self) -> int:
+        m, st = self.meta, self.state
+        args = [OMP_VIBE if m.get("vibe") else OMP, "--mode", "rpc", "--no-ui", "--cwd", m["workdir"],
+                "--session-dir", str(self.d / "sessions"), "--approval-mode", "yolo"]
+        if st.get("round", 1) > 1:
+            args.append("--continue")
+        if m.get("model"):
+            args += ["--model", m["model"]]
+        if m.get("max_time"):
+            args += ["--max-time", m["max_time"]]
+        args += m.get("omp_args") or []
+        self.slog("spawn: " + " ".join(args))
+        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=open(self.d / "omp.stderr", "ab"), cwd=m["workdir"])
+        self.set_state(status="starting", omp_pid=self.proc.pid, supervisor_pid=os.getpid(),
+                       round_started=now(), step=0, current_action=None, exit_code=None, error=None)
+        threading.Thread(target=self.reader, daemon=True).start()
+        threading.Thread(target=self.serve, daemon=True).start()
+        signal.signal(signal.SIGTERM, lambda *_: (setattr(self, "stop_requested", True), self.settled.set(), self.prompt_done.set()))
+
+        if not self.ready.wait(120):
+            return self.finish("error", "omp did not send ready frame")
+        self.request({"type": "negotiate_protocol", "protocolVersion": 2})
+        self.request({"type": "set_subagent_subscription", "level": "progress"})
+        self.request({"type": "set_event_filter", "events": None, "messageUpdates": "delta"})
+        info = self.request({"type": "get_state"}).get("data") or {}
+        model = info.get("model") or {}
+        self.set_state(session_file=info.get("sessionFile"), session_id=info.get("sessionId"),
+                       model=f"{model.get('provider','')}/{model.get('id','')}")
+
+        prompt = st["pending_prompt"]
+        with self.lock:
+            self.seq += 1
+            self.prompt_id = f"p{self.seq}"
+        slot = {"ev": threading.Event(), "resp": None}
+        self.pending[self.prompt_id] = slot
+        self.log(f"=== round {st.get('round', 1)} prompt: {short(prompt, 240)}")
+        self.send({"id": self.prompt_id, "type": "prompt", "message": prompt})
+        slot["ev"].wait(120)
+        if slot["resp"] and not slot["resp"].get("success"):
+            return self.finish("error", slot["resp"].get("error"))
+        if slot["resp"] and (slot["resp"].get("data") or {}).get("agentInvoked") is False:
+            self.prompt_done.set(); self.settled.set()
+        self.set_state(status="running")
+
+        # Done = prompt yielded AND the session is settled (no queued steer/follow-up, no bg jobs).
+        while True:
+            self.prompt_done.wait()
+            self.settled.wait()
+            if self.exited.is_set() or self.stop_requested:
+                break
+            s = self.request({"type": "get_state"}).get("data") or {}
+            if s.get("isSettled", True) and not s.get("isStreaming") and not s.get("queuedMessageCount"):
+                break
+            self.settled.clear()
+
+        if self.exited.is_set() and not self.stop_requested:
+            return self.finish("error", "omp exited unexpectedly")
+        last = self.request({"type": "get_last_assistant_text"}, timeout=30)
+        text = (last.get("data") or {}).get("text") if isinstance(last.get("data"), dict) else last.get("data")
+        if text:
+            (self.d / "final.md").write_text(text)
+            (self.d / "rounds").mkdir(exist_ok=True)
+            (self.d / "rounds" / f"{st.get('round', 1)}.md").write_text(text)
+        stats = self.request({"type": "get_session_stats"}, timeout=30).get("data")
+        if stats:
+            write_json(self.d / "stats.json", stats)
+        if self.stop_requested:
+            return self.finish("stopped", None)
+        if self.prompt_status == "error":
+            return self.finish("error", (self.prompt_error or {}).get("message"))
+        if self.prompt_status == "aborted":
+            return self.finish("stopped", "aborted")
+        return self.finish("done", None)
+
+    def finish(self, status: str, error) -> int:
+        try:
+            self.proc.stdin.close()                      # graceful omp shutdown (drains, exit 0)
+        except Exception:
+            pass
+        try:
+            code = self.proc.wait(30)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            try:
+                code = self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill(); code = self.proc.wait()
+        if status == "done" and code not in (0, None):
+            status, error = "error", error or f"omp exited with {code}"
+        self.set_state(status=status, error=error, exit_code=code, ended=now(), current_action=None,
+                       pending_prompt=None)
+        self.log(f"=== round {self.state.get('round', 1)} {status}" + (f": {short(error, 200)}" if error else "") + f" (omp exit {code})")
+        try:
+            os.unlink(self.d / "ctl.sock")
+        except FileNotFoundError:
+            pass
+        return EXIT.get(status, 1)
+
+
+# ------------------------------------------------------------------ client
+def ctl(d: Path, req: dict, timeout=60.0) -> dict:
+    sock = d / "ctl.sock"
+    if not sock.exists():
+        return {"success": False, "error": "run is not active (no control socket)"}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(sock))
+        s.sendall((json.dumps(req) + "\n").encode())
+        return json.loads(s.makefile().readline() or "{}")
+    except OSError as e:
+        return {"success": False, "error": f"control socket: {e}"}
+    finally:
+        s.close()
+
+def launch(d: Path) -> None:
+    log = open(d / "supervisor.log", "ab")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_supervise", str(d)],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                     close_fds=True)
+    for _ in range(600):  # wait until the supervisor is up and omp accepted the prompt
+        st = load_state(d)
+        if st.get("status") in {"running"} | TERMINAL:
+            return
+        time.sleep(0.2)
+
+def summary(d: Path) -> str:
+    st, meta = load_state(d), read_json(d / "meta.json", {})
+    lines = [f"run {meta.get('name')}  status={st.get('status')}  round={st.get('round')}  steps={st.get('step', 0)}  "
+             f"tools={st.get('tool_calls', 0)}  omp_exit={st.get('exit_code')}",
+             f"workdir {meta.get('workdir')}   model {st.get('last_model') or st.get('model')}"
+             + ("   mode vibe" if meta.get("vibe") else ""),
+             f"session {st.get('session_file')}",
+             f"dir     {d}"]
+    if st.get("round_started") and st.get("ended"):
+        t0 = dt.datetime.fromisoformat(st["round_started"].replace("Z", "+00:00"))
+        t1 = dt.datetime.fromisoformat(st["ended"].replace("Z", "+00:00"))
+        lines[0] += f"  duration={int((t1 - t0).total_seconds())}s"
+    if st.get("error"):
+        lines.append(f"error   {st['error']}")
+    final = d / "final.md"
+    if final.exists() and st.get("status") in TERMINAL:
+        lines += ["--- final answer ---", final.read_text().strip()]
+    return "\n".join(lines)
+
+def cmd_start(a) -> int:
+    d = run_dir(a.name)
+    if d.exists():
+        sys.exit(f"run {a.name!r} already exists ({d}); pick another name or `resume` it")
+    wd = Path(a.workdir).expanduser().resolve()
+    wd.mkdir(parents=True, exist_ok=True)
+    (d / "sessions").mkdir(parents=True)
+    ver = subprocess.run([OMP_VIBE if a.vibe else OMP, "--version"], capture_output=True, text=True).stdout.strip()
+    prompt = read_prompt(a.prompt)
+    write_json(d / "meta.json", {"name": a.name, "workdir": str(wd), "created": now(), "omp": ver,
+                                 "model": a.model, "max_time": a.max_time, "omp_args": a.omp_args,
+                                 "vibe": bool(a.vibe)})
+    write_json(d / "state.json", {"status": "starting", "round": 1, "pending_prompt": prompt, "created": now()})
+    append(d / "prompts.jsonl", json.dumps({"ts": now(), "kind": "prompt", "round": 1, "message": prompt}, ensure_ascii=False))
+    launch(d)
+    st = load_state(d)
+    print(f"started {a.name}: status={st.get('status')} dir={d}")
+    return cmd_wait(argparse.Namespace(name=a.name, timeout=None)) if a.wait else 0
+
+def cmd_resume(a) -> int:
+    d = run_dir(a.name)
+    st = load_state(d)
+    if not st:
+        sys.exit(f"no such run: {a.name}")
+    if st.get("status") not in TERMINAL:
+        sys.exit(f"run {a.name} is {st.get('status')}; use steer/followup while it runs")
+    prompt = read_prompt(a.prompt)
+    rnd = int(st.get("round", 1)) + 1
+    st.update(status="starting", round=rnd, pending_prompt=prompt, ended=None, error=None, exit_code=None,
+              supervisor_pid=None, omp_pid=None)
+    write_json(d / "state.json", st)
+    append(d / "prompts.jsonl", json.dumps({"ts": now(), "kind": "prompt", "round": rnd, "message": prompt}, ensure_ascii=False))
+    launch(d)
+    print(f"resumed {a.name} (round {rnd}): status={load_state(d).get('status')}")
+    return cmd_wait(argparse.Namespace(name=a.name, timeout=None)) if a.wait else 0
+
+def cmd_wait(a) -> int:
+    d = run_dir(a.name)
+    if not (d / "state.json").exists():
+        print(f"no such run: {a.name}"); return 4
+    t0 = time.time()
+    while True:
+        st = load_state(d)
+        if st.get("status") in TERMINAL:
+            print(summary(d)); return EXIT[st["status"]]
+        if a.timeout and time.time() - t0 > a.timeout:
+            print(f"timeout: {a.name} still {st.get('status')}"); return 3
+        time.sleep(1)
+
+def cmd_msg(a, op) -> int:
+    req = {"op": op, "message": read_prompt(a.message)}
+    if getattr(a, "agent", None):
+        req["agent"] = a.agent
+    r = ctl(run_dir(a.name), req)
+    print("ok" if r.get("success") else f"failed: {r.get('error')}")
+    return 0 if r.get("success") else 1
+
+def cmd_stop(a) -> int:
+    d = run_dir(a.name)
+    r = ctl(d, {"op": "stop"})
+    if not r.get("success"):
+        st = load_state(d)
+        if st.get("supervisor_pid") and pid_alive(st["supervisor_pid"]):
+            os.kill(int(st["supervisor_pid"]), signal.SIGTERM)
+        else:
+            print(f"failed: {r.get('error')}"); return 1
+    for _ in range(60):
+        if load_state(d).get("status") in TERMINAL:
+            break
+        time.sleep(0.5)
+    print(summary(d)); return 0
+
+def cmd_status(a) -> int:
+    d = run_dir(a.name)
+    st = load_state(d)
+    if not st:
+        print(f"no such run: {a.name}"); return 4
+    live = ctl(d, {"op": "get_state"}, timeout=10).get("data") if st.get("status") not in TERMINAL else None
+    if a.json:
+        print(json.dumps({"state": st, "live": live}, indent=2, ensure_ascii=False)); return 0
+    print(summary(d) if st.get("status") in TERMINAL else summary(d).split("--- final")[0].rstrip())
+    if st.get("status") not in TERMINAL:
+        print(f"step    {st.get('step', 0)}   now: {st.get('current_action') or ('thinking/streaming' if (live or {}).get('isStreaming') else 'idle')}")
+        if live:
+            q = live.get("queuedMessages") or {}
+            cu = live.get("contextUsage") or {}
+            print(f"live    streaming={live.get('isStreaming')} settled={live.get('isSettled')} queued={q} "
+                  f"context={cu.get('tokens')}/{cu.get('contextWindow')}")
+            subs = (ctl(d, {"op": "subagents"}, timeout=10).get("data") or {})
+            for sa in (subs.get("subagents") if isinstance(subs, dict) else subs) or []:
+                print(f"worker  {sa.get('id')} [{sa.get('agent')}] {sa.get('status')} "
+                      f"{short(sa.get('model') or '', 40)} {short(sa.get('description') or sa.get('lastActivity') or '', 80)}")
+            for ph in live.get("todoPhases") or []:
+                for t in ph.get("tasks", []):
+                    print(f"todo    [{t.get('status')}] {t.get('content')}")
+    log = d / "actions.log"
+    if log.exists():
+        lines = log.read_text().splitlines()[-a.n:]
+        print(f"--- last {len(lines)} actions ---"); print("\n".join(lines))
+    return 0
+
+def cmd_transcript(a) -> int:
+    d = run_dir(a.name)
+    files = sorted((d / "sessions").glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not files:
+        print("no session file yet"); return 1
+    f = Path(load_state(d).get("session_file") or files[-1])
+    if a.raw:
+        sys.stdout.write(f.read_text()); return 0
+    lim = None if a.full else 600
+    cut = (lambda s: s) if lim is None else (lambda s: s if len(s) <= lim else s[:lim] + f"… [+{len(s) - lim} chars]")
+    for line in f.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") != "message":
+            if e.get("type") in ("model_change",):
+                print(f"[model → {e.get('model')}]")
+            continue
+        m = e.get("message") or {}
+        role = m.get("role")
+        ts = (e.get("timestamp") or "")[11:19]
+        if role == "user":
+            print(f"\n## user {ts}\n{cut(text_of(m.get('content')))}")
+        elif role == "assistant":
+            print(f"\n## assistant {ts} ({m.get('model', '')})")
+            for b in m.get("content") or []:
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    print(cut(b["text"]))
+                elif b.get("type") == "toolCall":
+                    print(f"[tool call] {b.get('name')} {cut(json.dumps(b.get('arguments'), ensure_ascii=False))}")
+        elif role == "toolResult":
+            flag = " ERROR" if m.get("isError") else ""
+            print(f"[tool result{flag}] {m.get('toolName', '')}: {cut(text_of(m.get('content')))}")
+    return 0
+
+def cmd_list(a) -> int:
+    rows = []
+    for d in sorted(HOME.glob("*/state.json"), key=lambda p: p.stat().st_mtime):
+        st, meta = load_state(d.parent), read_json(d.parent / "meta.json", {})
+        rows.append({"name": meta.get("name"), "status": st.get("status"), "round": st.get("round"),
+                     "steps": st.get("step", 0), "created": meta.get("created"), "updated": st.get("updated"),
+                     "workdir": meta.get("workdir"), "vibe": bool(meta.get("vibe")), "last": st.get("last_assistant") or ""})
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False)); return 0
+    print(f"{'NAME':20} {'STATUS':8} {'MODE':5} {'RND':>3} {'STEP':>4} {'UPDATED':20} WORKDIR")
+    for r in rows:
+        print(f"{r['name']:20} {r['status'] or '?':8} {'vibe' if r['vibe'] else '-':5} {r['round'] or 0:>3} {r['steps']:>4} {r['updated'] or '':20} {r['workdir']}")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "_supervise":
+        return Supervisor(Path(sys.argv[2])).run()
+    p = argparse.ArgumentParser(prog="omp-task", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 1)[1])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start", help="start a detached run")
+    s.add_argument("name"); s.add_argument("workdir"); s.add_argument("prompt")
+    s.add_argument("--model", help="model or role (default: config default role)")
+    s.add_argument("--vibe", action="store_true", help="run as a vibe-mode director (see above)")
+    s.add_argument("--max-time", help="omp --max-time, e.g. 30m")
+    s.add_argument("--wait", action="store_true", help="block until finished")
+    s.add_argument("omp_args", nargs=argparse.REMAINDER, help="extra omp args after --")
+    w = sub.add_parser("wait"); w.add_argument("name"); w.add_argument("--timeout", type=float)
+    for op in ("steer", "followup"):
+        x = sub.add_parser(op); x.add_argument("name"); x.add_argument("message")
+        if op == "steer":
+            x.add_argument("--agent", help="subagent / vibe worker id (RPC steer_subagent)")
+    st = sub.add_parser("status"); st.add_argument("name"); st.add_argument("-n", type=int, default=15); st.add_argument("--json", action="store_true")
+    t = sub.add_parser("transcript"); t.add_argument("name"); t.add_argument("--full", action="store_true"); t.add_argument("--raw", action="store_true")
+    sp = sub.add_parser("stop"); sp.add_argument("name")
+    r = sub.add_parser("resume"); r.add_argument("name"); r.add_argument("prompt"); r.add_argument("--wait", action="store_true")
+    l = sub.add_parser("list"); l.add_argument("--json", action="store_true")
+    a = p.parse_args()
+    if getattr(a, "omp_args", None) and a.omp_args[0] == "--":
+        a.omp_args = a.omp_args[1:]
+    HOME.mkdir(parents=True, exist_ok=True)
+    return {"start": cmd_start, "wait": cmd_wait, "steer": lambda a: cmd_msg(a, "steer"),
+            "followup": lambda a: cmd_msg(a, "follow_up"), "status": cmd_status, "transcript": cmd_transcript,
+            "stop": cmd_stop, "resume": cmd_resume, "list": cmd_list}[a.cmd](a)
+
+if __name__ == "__main__":
+    sys.exit(main())

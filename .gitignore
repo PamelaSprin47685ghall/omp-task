@@ -1,0 +1,9 @@
+node_modules/
+__pycache__/
+*.pyc
+*.token
+*.key
+.env
+runs/
+.omp-task/
+/tmp/

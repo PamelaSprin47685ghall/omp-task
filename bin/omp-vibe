@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# omp-vibe — same CLI as `omp`, but the root session starts in vibe (director) mode.
+# Runs omp from its pinned npm source package via vibe/omp-vibe-rpc.ts (see README "How the vibe hook works").
+set -e
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+root=$(cd "$(dirname "$self")/.." && pwd)
+hook="${OMP_VIBE_HOOK:-$root/vibe/omp-vibe-rpc.ts}"
+if [ ! -d "$(dirname "$hook")/node_modules/@oh-my-pi/pi-coding-agent" ]; then
+  echo "omp-vibe: dependencies missing; run $root/install.sh (or: cd $root/vibe && bun install --frozen-lockfile)" >&2
+  exit 127
+fi
+BUN="${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
+exec "$BUN" "$hook" "$@"

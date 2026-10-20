@@ -1,0 +1,9 @@
+{
+  "name": "omp-vibe-rpc",
+  "private": true,
+  "type": "module",
+  "description": "Run omp (any CLI args, e.g. --mode rpc) with vibe director mode active on the root session",
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.4"
+  }
+}
