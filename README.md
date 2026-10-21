@@ -1,13 +1,50 @@
 # omp-task
 
-Headless, steerable background workers for [Oh My Pi (`omp`)](https://omp.sh): a small CLI that starts `omp` sessions detached, then lets you (or another AI agent) **wait / steer / follow up / inspect / read the transcript / stop / resume / list** them. It also adds **vibe director mode in RPC**, which stock omp only offers in its interactive TUI.
+**For hermes agents: read the next section first.** omp-task runs [Oh My Pi (`omp`)](https://omp.sh) sessions as headless, steerable background workers. With `--vibe`, an omp *director* spawns and manages its own worker sessions. Hermes uses this **instead of its built-in subagents**.
 
+## For hermes agents (read first)
+
+**Rule: never use built-in subagents.**
+- `delegate_task` is disabled (`agent.disabled_toolsets: [delegation]`).
+- Anything that needs a subagent, a background worker or parallel work runs as `omp-task start --vibe`.
+- Plain `omp-task start` (no `--vibe`) is only for a small single-agent job.
+
+The full playbook ships as a hermes skill: [`hermes/SKILL.md`](hermes/SKILL.md) (`omp-vibe-subagents`). The short version, with the hermes terminal tool:
+
+| step | hermes call |
+|---|---|
+| 1. brief | write a self-contained prompt file (goal, paths, constraints, acceptance commands), e.g. `/tmp/briefs/<name>.md` |
+| 2. start | `terminal(command="omp-task start <name> <workdir> --vibe @/tmp/briefs/<name>.md")`; returns in seconds |
+| 3. notify on finish | `terminal(command="omp-task wait <name>", background=true, notify=true)`: one notification when the run ends; read it with `process(action="log", session_id=…)`; exit code = outcome |
+| 3b. or block | `process(action="wait", session_id=…, timeout=600)` |
+| status | `omp-task status <name> -n 10` (step, workers, recent actions) |
+| steer | `omp-task steer <name> "<correction>"`; one worker: `--agent <worker-id>` |
+| more work | `omp-task followup <name> "<msg>"` (queued after the current turn) |
+| abort | `omp-task stop <name>` |
+| continue | `omp-task resume <name> "<next instruction>"`, then wait again (same session, still vibe) |
+| result | wait output or `~/.omp-task/runs/<name>/final.md`; **verify yourself** (run the tests); `omp-task transcript <name>` |
+
+**Exit codes of `wait`:** `0` done · `1` error · `2` stopped · `3` timeout (run continues) · `4` no such run. Don't poll in a loop; the background `wait` with `notify=true` is the completion signal. For parallel work, use one run plus one background `wait` per task, each with a unique name and its own workdir.
+
+### Setting up hermes for this
+
+Per profile (`-p <profile>`, or omit it for the default):
+
+```sh
+hermes -p <profile> config set agent.disabled_toolsets "[delegation]"      # remove delegate_task
+hermes -p <profile> skills install https://raw.githubusercontent.com/PamelaSprin47685ghall/omp-task/main/hermes/SKILL.md \
+  --category autonomous-ai-agents --yes                                     # the playbook as a skill
+cat >> ~/.hermes/profiles/<profile>/SOUL.md <<'RULE'
+
+## Subagents
+Never use built-in subagents/delegation. Anything that needs a subagent, background worker or parallel task
+must run through omp vibe: `omp-task start <name> <workdir> --vibe @brief.md`, then a background
+`omp-task wait <name>` with notify=true. Follow the `omp-vibe-subagents` skill.
+RULE
+systemctl restart hermes-gateway-<profile>   # or: hermes -p <profile> gateway restart
 ```
-omp-task start fix-tests ~/src/app "Make the failing tests in tests/ pass"
-omp-task status fix-tests -n 5
-omp-task steer  fix-tests "Don't touch the migrations folder"
-omp-task wait   fix-tests          # blocks; exit code tells you how it ended
-```
+
+The gateway's systemd PATH must find `omp-task`, `omp`, `omp-vibe` and `bun`. Either symlink them into `/usr/local/bin` or add `~/.local/bin` to the unit's `Environment=PATH`. Check by asking the agent to run `omp-task list`.
 
 ## Why
 
@@ -105,9 +142,9 @@ omp-task transcript wordstats | less
 omp-task resume wordstats "Also add a --json output flag" --wait
 ```
 
-## Agent playbook
+## Agent playbook (other agents)
 
-Written for an AI agent with a shell tool that can run commands in the background and be notified when they exit.
+For AI agents other than hermes (hermes: see the first section) that have a shell tool that can run commands in the background and be notified when they exit.
 
 1. **Start** — returns immediately:
    `omp-task start <name> <workdir> "<self-contained task, with acceptance criteria>"`
